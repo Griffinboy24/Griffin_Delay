@@ -19,8 +19,9 @@ namespace project
     using namespace scriptnode;
 
     /*==========================================================================*\
-        Griffin_BBD - true-stereo 4-chip BBD delay with feedback and
-                      independent wet / dry gains.
+        Griffin_BBD - true-stereo 4-chip BBD delay
+          - Each channel = four 4096-stage lines in series (16 384 stages total)
+          - Per-channel tolerances kept subtle 
     \*==========================================================================*/
     template <int NV>
     struct Griffin_BBD : public data::base
@@ -37,7 +38,7 @@ namespace project
         static constexpr int NumTables = 0;
         static constexpr int NumSliderPacks = 0;
         static constexpr int NumAudioFiles = 0;
-        static constexpr int NumFilters = 0; // <-- do not remove
+        static constexpr int NumFilters = 0;
         static constexpr int NumDisplayBuffers = 0;
 
         /*--------------------------------------------------------------------*/
@@ -45,123 +46,76 @@ namespace project
         {
         public:
             explicit AudioEffect(float initTotalMs = 333.0f,
-                float initFeedback = 0.35f,
-                float initWetGain = 1.0f,
-                float initDryGain = 1.0f,
+                float initWetMix = 0.5f,
                 int   initMode = 1) noexcept
-                : totalDelayMs(initTotalMs),
-                feedback(initFeedback),
-                wetGain(initWetGain),
-                dryGain(initDryGain),
-                voicingMode(initMode)
-            {
+                : totalDelayMs(initTotalMs), wetMix(initWetMix), voicingMode(initMode) {
             }
 
-            /* one-time setup (call from node::prepare) */
-            void prepare(double newFs, int maxBlock = 512)
+            void prepare(double newFs)
             {
                 fs = (float)newFs;
-                maxSamples = maxBlock;
-
-                dsp::ProcessSpec spec{ newFs, (uint32)maxBlock, 1 };
-                for (auto& d : line)
-                    d.prepare(spec);
-
-                wetBuffer.calloc((size_t)maxSamples, true);
-                dryBuffer.calloc((size_t)maxSamples, true);
-
+                dsp::ProcessSpec s{ newFs, 512, 1 };
+                for (auto& d : line) d.prepare(s);
                 updateParams();
             }
 
-            /* audio block processing */
             void process(float* buf, int n)
             {
-                FloatVectorOperations::copy(dryBuffer, buf, n); // keep pristine dry signal
-
                 for (int i = 0; i < n; ++i)
                 {
-                    const float inSample = dryBuffer[i];
-                    const float inWithFeedback = inSample + lastWetSample * feedback;
-
-                    float x = inWithFeedback;
-                    for (auto& d : line)
-                    {
-                        d.pushSample(0, x);
-                        x = d.popSample(0);
-                    }
-
-                    lastWetSample = x;
-                    wetBuffer[i] = x;
+                    float x = buf[i];
+                    for (auto& d : line) { d.pushSample(0, x); x = d.popSample(0); }
+                    buf[i] = (buf[i] * (1.0f - wetMix)) + (x * wetMix);
                 }
-
-                /* vectorised gain + sum */
-                FloatVectorOperations::multiply(dryBuffer, dryGain, n);
-                FloatVectorOperations::multiply(wetBuffer, wetGain, n);
-                FloatVectorOperations::copy(buf, dryBuffer, n);
-                FloatVectorOperations::add(buf, wetBuffer, n);
+                updateParams();
             }
 
-            /* public setters (called from node) */
+            /* public setters */
             void setTotalDelayMs(float v) { totalDelayMs = v; updateParams(); }
-            void setFeedback(float v) { feedback = jlimit(0.0f, 0.99f, v); }
-            void setWetGain(float v) { wetGain = v; }
-            void setDryGain(float v) { dryGain = v; }
-            void setVoicingMode(int   v) { voicingMode = jlimit(1, 4, v); updateParams(); }
+            void setWetMix(float v) { wetMix = v; }
+            void setVoicingMode(int v) { voicingMode = jlimit(1, 4, v); updateParams(); }
             void setTrim(float dTrim, float fTrim) { delayTrim = dTrim; filterTrim = fTrim; updateParams(); }
 
         private:
-            /* runs once per parameter change */
+            /* one computation per block */
             void updateParams()
             {
                 static constexpr float bright[4] = { 0.5f, 1.0f, 1.4f, 1.8f };
 
                 const float perChipMs = (totalDelayMs * delayTrim) * 0.25f; // 4 chips
                 const float dSamples = fs * perChipMs * 0.001f;
+                for (auto& d : line) d.setDelay(dSamples);
 
-                for (auto& d : line)
-                    d.setDelay(dSamples);
-
-                constexpr float refSec = 0.020f;
+                constexpr float refSec = 0.020f;                       // 20 ms reference
                 const float delaySec = dSamples / fs;
                 const float cutoff = chowdsp::BBD::BBDFilterSpec::inputFilterOriginalCutoff
                     * (refSec / delaySec)
                     * bright[voicingMode - 1]
                     * filterTrim;
 
-                for (auto& d : line)
-                    d.setFilterFreq(cutoff);
+                for (auto& d : line) d.setFilterFreq(cutoff);
             }
 
-            /* state */
             float fs = 48000.0f;
-            int   maxSamples = 0;
-
-            float totalDelayMs = 333.0f;
-            float feedback = 0.35f; // 0..0.99
-            float wetGain = 1.0f;  // linear
-            float dryGain = 1.0f;  // linear
+            float totalDelayMs = 333.0f;    // summed delay of all 4 chips
+            float wetMix = 0.5f;
             int   voicingMode = 1;
 
-            float delayTrim = 1.0f;
+            float delayTrim = 1.0f;        // per-channel offset
             float filterTrim = 1.0f;
 
-            float lastWetSample = 0.0f;
-
             chowdsp::BBD::BBDDelayWrapper<4096, false> line[4];
-
-            HeapBlock<float> wetBuffer;
-            HeapBlock<float> dryBuffer;
         };
 
         /*--------------------------------------------------------------------*/
         void prepare(PrepareSpecs s)
         {
-            L.prepare(s.sampleRate, 512);
-            R.prepare(s.sampleRate, 512);
+            L.prepare(s.sampleRate);
+            R.prepare(s.sampleRate);
 
-            /* subtle analogue L/R tolerance */
-            L.setTrim(0.999f, 1.000f);
-            R.setTrim(1.001f, 0.995f);
+            // Analog L R channel difference
+            L.setTrim(0.999f, 1.000f);  
+            R.setTrim(1.001f, 0.995f);  
         }
 
         void reset() {}
@@ -180,10 +134,8 @@ namespace project
         inline void setParameter(double v)
         {
             if constexpr (P == 0) { L.setTotalDelayMs((float)v); R.setTotalDelayMs((float)v); }
-            else if constexpr (P == 1) { L.setFeedback((float)v); R.setFeedback((float)v); }
-            else if constexpr (P == 2) { L.setWetGain((float)v); R.setWetGain((float)v); }
-            else if constexpr (P == 3) { L.setDryGain((float)v); R.setDryGain((float)v); }
-            else if constexpr (P == 4) { int m = (int)(v + 0.5); L.setVoicingMode(m); R.setVoicingMode(m); }
+            else if constexpr (P == 1) { L.setWetMix((float)v); R.setWetMix((float)v); }
+            else if constexpr (P == 2) { int m = (int)(v + 0.5); L.setVoicingMode(m); R.setVoicingMode(m); }
         }
 
         void createParameters(ParameterDataList& data)
@@ -193,20 +145,12 @@ namespace project
                 registerCallback<0>(p); p.setDefaultValue(1000.0); data.add(std::move(p));
             }
             {
-                parameter::data p("Feedback", { 0.0, 0.99, 0.001 });
-                registerCallback<1>(p); p.setDefaultValue(0.35); data.add(std::move(p));
-            }
-            {
-                parameter::data p("Wet Gain", { 0.0, 2.0, 0.001 });
-                registerCallback<2>(p); p.setDefaultValue(1.0); data.add(std::move(p));
-            }
-            {
-                parameter::data p("Dry Gain", { 0.0, 2.0, 0.001 });
-                registerCallback<3>(p); p.setDefaultValue(1.0); data.add(std::move(p));
+                parameter::data p("Wet Mix", { 0.0, 1.0, 0.01 });
+                registerCallback<1>(p); p.setDefaultValue(1.0); data.add(std::move(p));
             }
             {
                 parameter::data p("Brightness", { 1.0, 4.0, 1.0 });
-                registerCallback<4>(p); p.setDefaultValue(1.0); data.add(std::move(p));
+                registerCallback<2>(p); p.setDefaultValue(1.0); data.add(std::move(p));
             }
         }
 
@@ -219,3 +163,313 @@ namespace project
     };
 
 } // namespace project
+
+
+#pragma once
+
+#include <memory>      // unique_ptr
+#include <array>       // std::array
+#include <algorithm>   // std::fill
+
+#include "chowdsp_BBDFilterBank.h"   
+
+namespace chowdsp::BBD
+{
+/**
+ * A class to emulate an analog delay line
+ * made using a bucket-brigade device
+ */
+template <size_t STAGES, bool ALIEN = false>
+class BBDDelayLine
+{
+public:
+    BBDDelayLine() = default;
+    BBDDelayLine (BBDDelayLine&&) noexcept = default;
+    BBDDelayLine& operator= (BBDDelayLine&&) noexcept = default;
+
+    /** Prepares the delay line for processing */
+    void prepare (double sampleRate)
+    {
+        FS = (float) sampleRate;
+        Ts = 1.0f / FS;
+
+        tn = 0.0f;
+        evenOn = true;
+
+        inputFilter = std::make_unique<InputFilterBank> (Ts);
+        outputFilter = std::make_unique<OutputFilterBank> (Ts);
+        H0 = outputFilter->calcH0();
+
+        reset();
+    }
+
+    /** Resets the state of the delay */
+    void reset()
+    {
+        bufferPtr = 0;
+        std::fill (buffer.begin(), buffer.end(), 0.0f);
+    }
+
+    /**
+     * Sets the cutoff frequency of the input anti-imaging
+     * filter used by the bucket-brigade device
+     */
+    void setInputFilterFreq (float freqHz = BBDFilterSpec::inputFilterOriginalCutoff) const
+    {
+        inputFilter->set_freq (ALIEN ? freqHz * 0.2f : freqHz);
+        inputFilter->set_time (tn);
+    }
+
+    /**
+     * Sets the cutoff frequency of the output anti-aliasing
+     * filter used by the bucket-brigade device
+     */
+    void setOutputFilterFreq (float freqHz = BBDFilterSpec::outputFilterOriginalCutoff) const
+    {
+        outputFilter->set_freq (ALIEN ? freqHz * 0.2f : freqHz);
+        outputFilter->set_time (tn);
+    }
+
+    /**
+     * Sets the delay time of the delay line.
+     * Internally this changed the "clock rate"
+     * of the bucket-brigade device
+     */
+    void setDelayTime (float delaySec) noexcept
+    {
+        delaySec = juce::jmax (Ts, delaySec - Ts); // don't divide by zero!!
+
+        const auto clock_rate_hz = (2.0f * (float) STAGES) / delaySec;
+        Ts_bbd = 1.0f / clock_rate_hz;
+
+        // if Ts_bbd == 0, then we get an infinite loop, so limit the min. delay
+        Ts_bbd = juce::jmax (Ts * 0.01f, Ts_bbd);
+
+        const auto doubleTs = 2 * Ts_bbd;
+        inputFilter->set_delta (doubleTs);
+        outputFilter->set_delta (doubleTs);
+    }
+
+    /** Processes a sample with the delay line (ALIEN MODE) */
+    template <bool A = ALIEN>
+    inline std::enable_if_t<A, float>
+        process (float u) noexcept
+    {
+        SIMDComplex<float> xOutAccum;
+        float yBBD, delta;
+        while (tn < 1.0f)
+        {
+            if (evenOn)
+            {
+                inputFilter->calcG();
+                buffer[bufferPtr++] = xsimd::reduce_add (SIMDUtils::SIMDComplexMulReal (inputFilter->Gcalc, inputFilter->x));
+                bufferPtr = (bufferPtr <= STAGES) ? bufferPtr : 0;
+            }
+            else
+            {
+                yBBD = buffer[bufferPtr];
+                delta = yBBD - yBBD_old;
+                yBBD_old = yBBD;
+                outputFilter->calcG();
+                xOutAccum += outputFilter->Gcalc * delta;
+            }
+
+            evenOn = ! evenOn;
+            tn += Ts_bbd / Ts;
+        }
+        tn -= 1.0f;
+
+        inputFilter->process (u);
+        outputFilter->process (xOutAccum);
+        float sumOut = xsimd::reduce_add (xOutAccum.real());
+        return H0 * yBBD_old + sumOut;
+    }
+
+    /** Processes a sample with the delay line (BBD MODE) */
+    template <bool A = ALIEN>
+    inline std::enable_if_t<! A, float>
+        process (float u) noexcept
+    {
+        SIMDComplex<float> xOutAccum {};
+        float yBBD, delta;
+        while (tn < Ts)
+        {
+            if (evenOn)
+            {
+                inputFilter->calcG();
+                buffer[bufferPtr++] = xsimd::reduce_add (SIMDUtils::SIMDComplexMulReal (inputFilter->Gcalc, inputFilter->x));
+                bufferPtr = (bufferPtr <= STAGES) ? bufferPtr : 0;
+            }
+            else
+            {
+                yBBD = buffer[bufferPtr];
+                delta = yBBD - yBBD_old;
+                yBBD_old = yBBD;
+                outputFilter->calcG();
+                xOutAccum += outputFilter->Gcalc * delta;
+            }
+
+            evenOn = ! evenOn;
+            tn += Ts_bbd;
+        }
+        tn -= Ts;
+
+        inputFilter->process (u);
+        outputFilter->process (xOutAccum);
+        float sumOut = xsimd::reduce_add (xOutAccum.real());
+        return H0 * yBBD_old + sumOut;
+    }
+
+private:
+    float FS = 48000.0f;
+    float Ts = 1.0f / FS;
+    float Ts_bbd = Ts;
+
+    std::unique_ptr<InputFilterBank> inputFilter;
+    std::unique_ptr<OutputFilterBank> outputFilter;
+    float H0 = 1.0f;
+
+    std::array<float, STAGES + 1> buffer;
+    size_t bufferPtr = 0;
+
+    float yBBD_old = 0.0f;
+    float tn = 0.0f;
+    bool evenOn = true;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BBDDelayLine)
+};
+
+} // namespace chowdsp::BBD
+
+#pragma once
+/*
+    chowdsp_BBDDelayWrapper.h
+    Stand-alone version – no chowdsp::Buffer dependency.
+    -------------------------------------------------------------------
+    The class used to inherit from DelayLineBase<float>, which dragged in
+    chowdsp_Buffer.* and friends even though the BBD algorithm never used
+    that storage.  We simply:
+        • removed the inheritance,
+        • dropped the pure-virtual overrides,
+        • left the public API exactly the same so existing call-sites
+          build without edits.
+    -------------------------------------------------------------------
+    Dependencies that remain:
+        juce::dsp::ProcessSpec   – for block-size / sample-rate
+        <vector>                 – channel containers
+        chowdsp_BBDDelayLine.h   – the actual DSP engine
+*/
+
+#include <vector>
+#include <juce_dsp/juce_dsp.h>
+
+#include "chowdsp_BBDDelayLine.h"
+
+namespace chowdsp::BBD
+{
+    /**
+     * A thin, multi-channel wrapper around BBDDelayLine.
+     *
+     * @attention Call setFilterFreq() each audio block (or every few blocks)
+     *            so that the BBD internal clock stays aligned.
+     */
+    template <size_t STAGES, bool ALIEN = false>
+    class BBDDelayWrapper
+    {
+    public:
+        //==============================================================================
+        BBDDelayWrapper() = default;
+
+        //==============================================================================
+        /** Sets both anti-aliasing filter cut-offs (input+output). */
+        void setFilterFreq(float freqHz)
+        {
+            setInputFilterFreq(freqHz);
+            setOutputFilterFreq(freqHz);
+        }
+
+        /** Sets the input anti-imaging filter frequency. */
+        void setInputFilterFreq(float freqHz)
+        {
+            for (auto& line : lines)
+                line.setInputFilterFreq(freqHz);
+        }
+
+        /** Sets the output anti-aliasing filter frequency. */
+        void setOutputFilterFreq(float freqHz)
+        {
+            for (auto& line : lines)
+                line.setOutputFilterFreq(freqHz);
+        }
+
+        //==============================================================================
+        /** Delay length in *samples*. */
+        void setDelay(float newDelayInSamples)
+        {
+            delaySamp = newDelayInSamples;
+
+            const float delaySec = delaySamp / sampleRate;
+            for (auto& line : lines)
+                line.setDelayTime(delaySec);
+        }
+
+        [[nodiscard]] float getDelay() const noexcept { return delaySamp; }
+
+        //==============================================================================
+        /** Allocate and reset internal state for the given I/O configuration. */
+        void prepare(const juce::dsp::ProcessSpec& spec)
+        {
+            sampleRate = static_cast<float> (spec.sampleRate);
+
+            inputs.resize(spec.numChannels, 0.0f);
+
+            lines.clear();
+            for (size_t ch = 0; ch < spec.numChannels; ++ch)
+            {
+                lines.emplace_back();
+                lines[ch].prepare(sampleRate);
+                lines[ch].setInputFilterFreq();
+                lines[ch].setOutputFilterFreq();
+            }
+        }
+
+        /** Free all dynamic memory. */
+        void free()
+        {
+            inputs.clear();
+            lines.clear();
+        }
+
+        /** Reset internal delay-line state (but keep current size). */
+        void reset()
+        {
+            for (auto& line : lines)
+                line.reset();
+        }
+
+        //==============================================================================
+        /** Push one sample into the delay line on the specified channel. */
+        inline void pushSample(int channel, float x) noexcept
+        {
+            inputs[static_cast<size_t> (channel)] = x;
+        }
+
+        /** Pop one sample out of the delay line on the specified channel. */
+        inline float popSample(int channel) noexcept
+        {
+            const size_t ch = static_cast<size_t> (channel);
+            return lines[ch].process(inputs[ch]);
+        }
+
+    private:
+        //==============================================================================
+        float delaySamp = 1.0f;        // delay in samples
+        float sampleRate = 48000.0f;    // cached FS
+
+        std::vector<BBDDelayLine<STAGES, ALIEN>> lines; // one per channel
+        std::vector<float>                       inputs;
+
+        JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(BBDDelayWrapper)
+    };
+
+} // namespace chowdsp::BBD
